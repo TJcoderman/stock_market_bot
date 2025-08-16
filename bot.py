@@ -720,11 +720,11 @@ class ModelArtifacts:
 
 
 class Pipeline:
-    def __init__(self, interval: str = "1d"):
+    def __init__(self, interval: str = "1d", news_api_key: Optional[str] = None):
         self.interval = interval
         self.fe = FeatureEngineer()
         self.pairs = PairsAnalyzer(max_pairs=3)
-        news_key = os.environ.get("NEWSAPI_KEY")
+        news_key = news_api_key or os.environ.get("NEWSAPI_KEY")
         self.sent = SentimentProvider(api_key=news_key)
 
     def prepare_data(self, tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
@@ -810,7 +810,7 @@ class Pipeline:
         out = pd.concat(results).sort_index()
         return out
 
-    def backtest(self, df: pd.DataFrame, interval: str, plot: bool = False) -> Dict[str, float]:
+    def backtest(self, df: pd.DataFrame, interval: str, plot: bool = False, initial_cash: float = 1_000_000.0) -> Dict[str, float]:
         if bt is None or plt is None:
             # Fallback simple backtest with transaction costs approximation
             logger.warning("Backtrader/matplotlib not available; using naive backtest.")
@@ -834,7 +834,7 @@ class Pipeline:
         feed_df.rename(columns={"rl_signal": "signal", "ensemble_pred": "pred"}, inplace=True)
         # Backtrader engine
         cerebro = bt.Cerebro()
-        cerebro.broker.setcash(1_000_000.0)
+        cerebro.broker.setcash(float(initial_cash))
         cerebro.addsizer(bt.sizers.FixedSize, stake=1)
         # Commission & slippage
         cerebro.broker.setcommission(commission=BROKERAGE_PCT)
@@ -851,7 +851,7 @@ class Pipeline:
         logger.info("Final Portfolio Value: %.2f", portfolio_value)
         # Extract returns from backtrader (proxy equity curve)
         equity_curve = feed_df["Close"].copy()
-        equity_curve[:] = np.linspace(1.0, 1.0 * portfolio_value / 1_000_000.0, len(equity_curve))
+        equity_curve[:] = np.linspace(1.0, float(portfolio_value) / float(initial_cash), len(equity_curve))
         ret_series = equity_curve.pct_change().fillna(0.0)
         metrics = {
             "sharpe": Metrics.sharpe(ret_series, interval),
@@ -869,13 +869,19 @@ class Pipeline:
 # Live Mode
 # --------------------------------------------------------------------------------------
 class LiveRunner:
-    def __init__(self, pipeline: Pipeline, tickers: List[str], interval: str, poll_secs: int = 120, paper: bool = True, broker: Optional[str] = None):
+    def __init__(self, pipeline: Pipeline, tickers: List[str], interval: str, poll_secs: int = 120, paper: bool = True, broker: Optional[str] = None, initial_cash: float = 50_000.0, max_allocation_pct: float = 0.2, fixed_qty: Optional[int] = None, exchange: str = "BSE", product: str = "CNC", allow_shorts: bool = False):
         self.pipeline = pipeline
         self.tickers = tickers
         self.interval = interval
         self.poll_secs = poll_secs
         self.paper = paper
         self.broker = broker
+        self.initial_cash = float(initial_cash)
+        self.max_allocation_pct = float(max_allocation_pct)
+        self.fixed_qty = fixed_qty
+        self.exchange = exchange
+        self.product = product
+        self.allow_shorts = allow_shorts
         self.kite = None
         if broker == "zerodha" and KiteConnect is not None and not paper:
             api_key = os.environ.get("KITE_API_KEY")
@@ -898,18 +904,18 @@ class LiveRunner:
             # Example market order via Kite; map ticker if needed to NSE/BSE instruments
             self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
-                exchange=self.kite.EXCHANGE_BSE,
-                tradingsymbol=ticker.replace(".BO", ""),
+                exchange=self.kite.EXCHANGE_BSE if self.exchange.upper() == "BSE" else self.kite.EXCHANGE_NSE,
+                tradingsymbol=ticker.replace(".BO", "") if self.exchange.upper() == "BSE" else ticker.replace(".NS", ""),
                 transaction_type=self.kite.TRANSACTION_TYPE_BUY if action == "BUY" else self.kite.TRANSACTION_TYPE_SELL,
-                quantity=quantity,
-                product=self.kite.PRODUCT_CNC,
+                quantity=int(quantity),
+                product=self.kite.PRODUCT_CNC if self.product.upper() == "CNC" else self.kite.PRODUCT_MIS,
                 order_type=self.kite.ORDER_TYPE_MARKET,
             )
         except Exception as exc:
             logger.warning("Order failed: %s", exc)
 
     def loop(self):
-        logger.info("Starting live loop (paper=%s, interval=%s)...", self.paper, self.interval)
+        logger.info("Starting live loop (paper=%s, interval=%s, initial_cash=%.2f)...", self.paper, self.interval, self.initial_cash)
         while True:
             try:
                 end = dt.datetime.now()
@@ -918,12 +924,18 @@ class LiveRunner:
                 for t, df in feats.items():
                     wf = self.pipeline.run_walk_forward(df)
                     last = wf.iloc[-1]
-                    sig = int(last.get("rl_signal", 0))
+                    s = int(last.get("rl_signal", 0))
                     pred = float(last.get("ensemble_pred", 0.0))
-                    if sig > 0 and pred > 0:
-                        self.place_order(t, "BUY", 1)
-                    elif sig < 0 and pred < 0:
-                        self.place_order(t, "SELL", 1)
+                    risk = float(last.get("risk", 0.1))
+                    px = float(df["Close"].iloc[-1]) if "Close" in df.columns and len(df) > 0 else 0.0
+                    allocation_frac = min(self.max_allocation_pct, max(0.05, min(0.95, risk)))
+                    qty = self.fixed_qty if self.fixed_qty is not None else (int((self.initial_cash * allocation_frac) / max(px, 1e-6)))
+                    qty = max(1, qty)
+                    # SEBI-friendly default: avoid naked shorts unless allowed. If sig < 0, sell only if pred < 0 and allow_shorts is True.
+                    if s > 0 and pred > 0:
+                        self.place_order(t, "BUY", qty)
+                    elif s < 0 and pred < 0 and self.allow_shorts:
+                        self.place_order(t, "SELL", qty)
                 time.sleep(self.poll_secs)
             except KeyboardInterrupt:
                 logger.info("Live loop stopped.")
@@ -1002,10 +1014,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plot", action="store_true", help="Plot backtest chart (Backtrader)")
     p.add_argument("--optimize", action="store_true", help="Run Optuna optimization")
     p.add_argument("--trials", type=int, default=10, help="Optuna trials")
+    p.add_argument("--newsapi-key", type=str, default=None, help="NewsAPI key for sentiment")
+    p.add_argument("--initial-cash", type=float, default=1_000_000.0, help="Initial cash for backtest/live sizing (INR)")
     p.add_argument("--live", action="store_true", help="Run live mode (paper by default)")
     p.add_argument("--poll-secs", type=int, default=120, help="Polling interval for live mode")
     p.add_argument("--paper", action="store_true", help="Paper trading in live mode")
     p.add_argument("--broker", type=str, default=None, choices=[None, "zerodha"], help="Broker integration (optional)")
+    p.add_argument("--max-allocation-pct", type=float, default=0.2, help="Max per-ticker capital allocation fraction in live mode")
+    p.add_argument("--fixed-qty", type=int, default=None, help="Fixed order quantity override in live mode")
+    p.add_argument("--exchange", type=str, default="BSE", choices=["BSE", "NSE"], help="Exchange for orders")
+    p.add_argument("--product", type=str, default="CNC", choices=["CNC", "MIS"], help="Zerodha product type")
+    p.add_argument("--allow-shorts", action="store_true", help="Allow short sells in live mode (use with caution)")
     return p.parse_args()
 
 
@@ -1014,10 +1033,23 @@ def main():
     tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
     logger.info("Tickers: %s", tickers)
 
-    pipeline = Pipeline(interval=args.interval)
+    pipeline = Pipeline(interval=args.interval, news_api_key=args.newsapi_key)
 
     if args.live:
-        live = LiveRunner(pipeline=pipeline, tickers=tickers, interval=args.interval, poll_secs=args.poll_secs, paper=args.paper, broker=args.broker)
+        live = LiveRunner(
+            pipeline=pipeline,
+            tickers=tickers,
+            interval=args.interval,
+            poll_secs=args.poll_secs,
+            paper=args.paper,
+            broker=args.broker,
+            initial_cash=args.initial_cash,
+            max_allocation_pct=args.max_allocation_pct,
+            fixed_qty=args.fixed_qty,
+            exchange=args.exchange,
+            product=args.product,
+            allow_shorts=args.allow_shorts,
+        )
         live.loop()
         return
 
@@ -1039,7 +1071,7 @@ def main():
 
     wf = pipeline.run_walk_forward(df)
 
-    metrics = pipeline.backtest(wf, interval=args.interval, plot=args.plot)
+    metrics = pipeline.backtest(wf, interval=args.interval, plot=args.plot, initial_cash=args.initial_cash)
 
     # Console summary
     print("\n=== Backtest Summary ===")
